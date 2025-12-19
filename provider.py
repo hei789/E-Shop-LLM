@@ -3,6 +3,7 @@ from openai import OpenAI
 import psutil
 import os
 import signal
+import json
 
 
 # ----------------- 模型配置 -----------------
@@ -21,16 +22,45 @@ import socket
 
 app = Flask(__name__)
 
-# 进行聊天
+# 抽取实体的工具函数
+def extract_topic_entities(answer_text: str) -> list[str]:
+    """
+    extract_topic_entities 的 Docstring
+    先用最暴利的,让LLM自己抽取实体
+    :param answer_text: 说明
+    :type answer_text: str
+    :return: 说明
+    :rtype: list[str]
+    """
+    prompt = (
+        "下面是一段回答，请从中抽取出所有关键的话题实体（人名、作品、组织、地点等），请注意，一定要是话题实体，实体数量不要多于五个"
+        "输出严格 JSON 列表，不要解释：\n\n"
+        f"{answer_text}"
+    )
+    rsp = client.chat.completions.create(
+        model = MODEL,
+        messages = [{"role":"user", "content": prompt}],
+        temperature = 0
+    )
+    try:
+        print(f"{rsp.choices[0].message.content.strip()}")
+        return json.loads(rsp.choices[0].message.content.strip())
+    except Exception:
+        return []
+
+
+# 进行聊天，SSE方式返回结果
 @app.route("/chat", methods=["POST"])
 def chat():
     data = request.get_json(silent=True) or {}
-    prompt = data.get("prompt", "") or "你是谁？"
+    prompt = data.get("prompt", "") or "你是谁？" # 从客户端发来的请求中获取 用户问题
     prompt = f"{prompt}"
     if not prompt:
         return jsonify(error="missing prompt"), 400
     print(prompt) # 目前是用户输入啥Prompt就是啥
     def generate():
+        # 第一阶段，LLM回答问题
+        answer_chunks = []
         completion = client.chat.completions.create(
             model=MODEL,
             messages=[
@@ -43,8 +73,24 @@ def chat():
         for chunk in completion:
             # 每块都立即 flush 出去
             print(chunk.model_dump_json())
-            print("下一个")
+            answer_chunks.append(chunk.model_dump_json())
             yield f"data:{chunk.model_dump_json()}\n"
+        
+        # 第二阶段
+        full_answer = ""
+        for ck in answer_chunks:
+            c = json.loads(ck)
+            if len(c["choices"]) >= 1:
+                delta = c["choices"][0]["delta"].get("content") or ""
+                full_answer += delta
+        entities = extract_topic_entities(full_answer)
+        fake_chunk = {
+            "choices": [{
+                "delta": {"content": f"\n**话题实体**：{json.dumps(entities, ensure_ascii=False)}"}
+            }],
+            "role": "topic-entities" 
+        }
+        yield f"event: entities\ndata:{json.dumps(fake_chunk, ensure_ascii=False)}\n\n"
 
     return Response(stream_with_context(generate()),
                     mimetype="text/event-stream")
